@@ -1,0 +1,396 @@
+From bfb40303d66804da3f685ba73425234a0d6ba314 Mon Sep 17 00:00:00 2001
+From: Simon McVittie <smcv@debian.org>
+Date: Sun, 7 Jul 2019 16:59:33 +0100
+Subject: [PATCH] debci-generate-apt-sources: Add and use a script to generate
+ sources.list
+
+Unlike the simpler versions open-coded in backends/lxc/create-testbed,
+backends/qemu/customize.sh, backends/schroot/create-testbed and
+bin/debci-setup-chdist, this one has special cases for:
+
+* unsupported Ubuntu suites using a different mirror
+* unsupported and LTS Debian suites using a different mirror
+* Debian suites <= jessie not having a -dbgsym archive
+* unsupported and LTS Debian suites not existing on incoming.debian.org
+* buildd-proposed-updates not being called buildd-stable-proposed-updates
+
+Signed-off-by: Simon McVittie <smcv@debian.org>
+Closes: #77
+---
+ backends/lxc/create-testbed     |  26 ++---
+ backends/qemu/customize.sh      |  19 +---
+ backends/schroot/create-testbed |  31 ++---
+ bin/debci-generate-apt-sources  | 196 ++++++++++++++++++++++++++++++++
+ bin/debci-setup-chdist          |  42 +++----
+ 5 files changed, 243 insertions(+), 71 deletions(-)
+ create mode 100755 bin/debci-generate-apt-sources
+
+diff --git a/backends/lxc/create-testbed b/backends/lxc/create-testbed
+index fdad06f..5a8cab5 100755
+--- a/backends/lxc/create-testbed
++++ b/backends/lxc/create-testbed
+@@ -117,25 +117,15 @@ created=yes
+ LXC_PATH=$(lxc-config lxc.lxcpath) || LXC_PATH=/var/lib/lxc
+ 
+ rootfs=$LXC_PATH/$container/rootfs
+-# FIXME duplicates logic in bin/debci-setup-chdist && backends/schroot/create-testbed
++
+ if [ "$distro" = debian ]; then
+-  if [ "$debci_suite" = unstable ]; then
+-    buildd_suite="buildd-$debci_suite"
+-  elif [ "$debci_suite" = stable ]; then
+-    # workaround for bug #880105
+-    stable=$(curl -Ls http://deb.debian.org/debian/dists/stable/Release | grep-dctrl -n -s Codename '')
+-    buildd_suite="buildd-$stable-proposed-updates"
+-  else
+-    buildd_suite="buildd-$debci_suite-proposed-updates"
+-  fi
+-  cat > "${rootfs}/etc/apt/sources.list.d/buildd.list" <<EOF
+-deb http://incoming.debian.org/debian-buildd $buildd_suite main contrib main
+-deb-src http://incoming.debian.org/debian-buildd $buildd_suite main contrib main
+-EOF
+-  cat > "${rootfs}/etc/apt/sources.list.d/debug.list" <<EOF
+-deb http://deb.debian.org/debian-debug ${debci_suite}-debug main contrib main
+-deb-src http://deb.debian.org/debian-debug ${debci_suite}-debug main contrib main
+-EOF
++  debci-generate-apt-sources \
++    --source \
++    --buildd \
++    --dbgsym \
++    -- \
++    "$debci_suite" \
++    > "$rootfs/etc/apt/sources.list"
+   while ! chroot "$rootfs" apt-get update; do
+     echo "I: apt-get update failed, let's wait some time and try again "
+     sleep 10
+diff --git a/backends/qemu/customize.sh b/backends/qemu/customize.sh
+index 6deb635..0417f67 100755
+--- a/backends/qemu/customize.sh
++++ b/backends/qemu/customize.sh
+@@ -24,19 +24,12 @@ else
+ fi
+ 
+ if [ "$distro" = debian ]; then
+-  if [ "$debci_suite" = unstable ]; then
+-    buildd_suite="buildd-$debci_suite"
+-  elif [ "$debci_suite" = stable ]; then
+-    # workaround for bug #880105
+-    stable=$(curl -Ls http://deb.debian.org/debian/dists/stable/Release | grep-dctrl -n -s Codename '')
+-    buildd_suite="buildd-$stable-proposed-updates"
+-  else
+-    buildd_suite="buildd-$debci_suite-proposed-updates"
+-  fi
+-  cat > "${rootfs}/etc/apt/sources.list.d/buildd.list" <<EOF
+-deb http://incoming.debian.org/debian-buildd $buildd_suite main
+-deb-src http://incoming.debian.org/debian-buildd $buildd_suite main
+-EOF
++  debci-generate-apt-sources \
++    --source \
++    --buildd \
++    -- \
++    "$debci_suite" \
++    > "$rootfs/etc/apt/sources.list"
+   while ! chroot "$rootfs" apt-get update; do
+     echo "I: apt-get update failed, let's wait some time and try again "
+     sleep 10
+diff --git a/backends/schroot/create-testbed b/backends/schroot/create-testbed
+index bff0d3c..dbb95b0 100755
+--- a/backends/schroot/create-testbed
++++ b/backends/schroot/create-testbed
+@@ -48,28 +48,17 @@ create_chroot() {
+   # do not download translations
+   echo 'Acquire::Languages "none";' > "${debci_chroot_path}/etc/apt/apt.conf.d/99translations"
+ 
+-  # add APT Source URIs
+-  sed -e 's/^deb\s/deb-src /' "${debci_chroot_path}/etc/apt/sources.list" > "${debci_chroot_path}/etc/apt/sources.list.d/sources.list"
+-
+-  # FIXME duplicates logic in bin/debci-setup-chdist && backends/lxc/create-testbed
+   if grep -q debian "${debci_chroot_path}/etc/apt/sources.list"; then
+-    if [ "$debci_suite" = unstable ]; then
+-      buildd_suite="buildd-$debci_suite"
+-    elif [ "$debci_suite" = stable ]; then
+-      # workaround for bug #880105
+-      stable=$(curl -Ls http://deb.debian.org/debian/dists/stable/Release | grep-dctrl -n -s Codename '')
+-      buildd_suite="buildd-$stable-proposed-updates"
+-    else
+-      buildd_suite="buildd-$debci_suite-proposed-updates"
+-    fi
+-    cat > "${debci_chroot_path}/etc/apt/sources.list.d/buildd.list" <<EOF
+-deb http://incoming.debian.org/debian-buildd $buildd_suite main contrib non-free
+-deb-src http://incoming.debian.org/debian-buildd $buildd_suite main contrib non-free
+-EOF
+-  cat > "${debci_chroot_path}/etc/apt/sources.list.d/debug.list" <<EOF
+-deb http://deb.debian.org/debian-debug ${debci_suite}-debug main contrib main
+-deb-src http://deb.debian.org/debian-debug ${debci_suite}-debug main contrib main
+-EOF
++    debci-generate-apt-sources \
++      --mirror="$debci_mirror" \
++      --source \
++      --buildd \
++      --dbgsym \
++      -- \
++      "$debci_suite" \
++      > "$debci_chroot_path/etc/apt/sources.list"
++  else
++    sed -e 's/^deb\s/deb-src /' "${debci_chroot_path}/etc/apt/sources.list" > "${debci_chroot_path}/etc/apt/sources.list.d/sources.list"
+   fi
+ 
+   # never ask for input
+diff --git a/bin/debci-generate-apt-sources b/bin/debci-generate-apt-sources
+new file mode 100755
+index 0000000..6747206
+--- /dev/null
++++ b/bin/debci-generate-apt-sources
+@@ -0,0 +1,196 @@
++#!/bin/sh
++
++set -eu
++
++usage() {
++  echo "Usage: debci-generate-apt-sources [OPTIONS] SUITE"
++  echo
++  echo "Generate the contents of /etc/apt/sources.list"
++  echo
++  echo "Options:"
++  echo
++  echo "  --buildd            Include apt sources for Debian buildds if available"
++  echo "  --components=\"x y\"  Use these components instead of a default"
++  echo "  --dbgsym            Include detached debug symbols if available"
++  echo "  --mirror=MIRROR     Use this mirror instead of a default"
++  echo "  --single-arch       Only download binary packages for one architecture"
++  echo "  --source            Include deb-src lines"
++  echo
++  echo "$@"
++}
++
++short_options=''
++long_options='buildd,components:,dbgsym,single-arch,source'
++
++debci_base_dir=$(readlink -f $(dirname $(readlink -f $0))/..)
++cd $debci_base_dir
++. lib/environment.sh
++
++buildd=
++components=
++dbgsym=
++deb_src=
++single_arch=
++
++while true; do
++  opt="$1"
++  shift
++  case "$opt" in
++    --buildd)
++      buildd=yes
++      ;;
++    --components)
++      components="$1"
++      shift
++      ;;
++    --dbgsym)
++      dbgsym=yes
++      ;;
++    --single-arch)
++      single_arch=yes
++      ;;
++    --source)
++      deb_src=yes
++      ;;
++    --)
++      break
++      ;;
++  esac
++done
++
++if [ "$#" -ne 1 ]; then
++  usage
++  exit 1
++fi
++
++debci_suite="$1"
++
++echo_deb_and_maybe_src () {
++  if [ -n "$single_arch" ]; then
++    echo "deb [arch=$debci_arch] $*"
++  else
++    echo "deb $*"
++  fi
++
++  if [ -n "$deb_src" ]; then
++    echo "deb-src $*"
++  fi
++}
++
++case "$debci_suite" in
++  (oldstable|testing)
++    # Since buster was released, all of these have the -dbgsym archive
++    dbgsym_suite="${debci_suite}-debug"
++    is_debian=yes
++    is_ubuntu=
++    buildd_suite="buildd-${debci_suite}-proposed-updates"
++    ;;
++
++  (unstable|sid|experimental|*-backports)
++    # These don't have -proposed-updates
++    dbgsym_suite="${debci_suite}-debug"
++    is_debian=yes
++    is_ubuntu=
++    buildd_suite="buildd-${debci_suite}"
++    ;;
++
++  (stable)
++    # The buildd suite for stable-proposed-updates is just called
++    # buildd-proposed-updates, not buildd-stable-proposed-updates as one
++    # might expect from the pattern set by other older-than-unstable suites
++    dbgsym_suite="${debci_suite}-debug"
++    is_debian=yes
++    is_ubuntu=
++    buildd_suite="buildd-proposed-updates"
++    ;;
++
++  (*)
++    if echo "${debci_suite}" |
++      grep -F "$(debian-distro-info --all)" > /dev/null
++    then
++      is_debian=yes
++    else
++      is_debian=
++    fi
++
++    if echo "${debci_suite}" |
++      grep -F "$(ubuntu-distro-info --all)" > /dev/null
++    then
++      is_ubuntu=yes
++    else
++      is_ubuntu=
++    fi
++
++    if echo "${debci_suite}" |
++      grep -F "$(debian-distro-info --supported)" > /dev/null
++    then
++      # Since jessie mainstream support ended, all supported (non-LTS)
++      # Debian suites have the -dbgsym archive and -proposed-updates
++      buildd_suite="buildd-${debci_suite}-proposed-updates"
++      dbgsym_suite="${debci_suite}-debug"
++    elif [ -n "$is_debian" ]; then
++      # Unsupported or LTS Debian suites don't have incoming.debian.org
++      buildd_suite=
++      # Unsupported or LTS Debian suites won't have dbgsym until stretch
++      # becomes unsupported
++      if [ "$(debian-distro-info --days=release --series="$debci_suite" --date=2017-01-01)" -ge 0 ]; then
++        dbgsym_suite="${debci_suite}-debug"
++      else
++        dbgsym_suite=
++      fi
++    else
++      # Not Debian at all.
++      buildd_suite=
++      dbgsym_suite=
++    fi
++    ;;
++esac
++
++if [ -z "$components" ]; then
++  if [ -n "$is_ubuntu" ]; then
++    components="main universe restricted multiverse"
++  else
++    # we assume unknown distributions behave like Debian
++    components="main contrib non-free"
++  fi
++fi
++
++if [ -z "$debci_mirror" ]; then
++  if [ -n "$is_debian" ]; then
++    case "$(debian-distro-info --days=eol --series="$debci_suite")" in
++      (-*)
++        # release is already EOL
++        debci_mirror="http://archive.debian.org/debian"
++        ;;
++      (*)
++        # (unknown) or a positive number: not EOL yet
++        debci_mirror="http://deb.debian.org/debian"
++        ;;
++    esac
++  elif [ -n "$is_ubuntu" ]; then
++    case "$(ubuntu-distro-info --days=eol --series="$debci_suite")" in
++      (-*)
++        # release is already EOL
++        debci_mirror="http://old-releases.ubuntu.com/ubuntu"
++        ;;
++      (*)
++        # (unknown) or a positive number: not EOL yet
++        debci_mirror="http://archive.ubuntu.com/ubuntu"
++        ;;
++    esac
++  else
++    echo "$0: unknown release suite '$debci_suite'" >&2
++    echo "$0: please specify --mirror option" >&2
++    exit 1
++  fi
++fi
++
++echo_deb_and_maybe_src "${debci_mirror} ${debci_suite} ${components}"
++
++if [ -n "$dbgsym" ] && [ -n "$dbgsym_suite" ]; then
++  echo_deb_and_maybe_src "http://deb.debian.org/debian-debug ${dbgsym_suite} ${components}"
++fi
++
++if [ -n "$buildd" ] && [ -n "$buildd_suite" ]; then
++  echo_deb_and_maybe_src "http://incoming.debian.org/debian-buildd ${buildd_suite} ${components}"
++fi
+diff --git a/bin/debci-setup-chdist b/bin/debci-setup-chdist
+index e924ecb..af82c46 100755
+--- a/bin/debci-setup-chdist
++++ b/bin/debci-setup-chdist
+@@ -49,25 +49,29 @@ mirror=${debci_mirror:-$DEF_MIRROR}
+ 
+ # write apt sources.list
+ mkdir -p $TARGET/etc/apt/
+-echo "deb [arch=${debci_arch}] $mirror $SUITE $COMPONENTS
+-deb-src $mirror $SUITE $COMPONENTS" > "$TARGET/etc/apt/sources.list"
+-
+-# add buildd sources
+-# FIXME duplicates logic in backends/(schroot|lxc)/create-testbed
+-if grep -q debian "$TARGET/etc/apt/sources.list"; then
+-  if [ "$SUITE" = unstable ]; then
+-    buildd_suite=buildd-$SUITE
+-  elif [ "$SUITE" = stable ]; then
+-    # workaround https://bugs.debian.org/880105
+-    buildd_suite=buildd-$(distro-info --stable)-proposed-updates
+-  else
+-    buildd_suite=buildd-$SUITE-proposed-updates
+-  fi
+-  cat >> "$TARGET/etc/apt/sources.list" <<EOF
+-deb [arch=${debci_arch}] http://incoming.debian.org/debian-buildd $buildd_suite $COMPONENTS
+-deb-src http://incoming.debian.org/debian-buildd $buildd_suite $COMPONENTS
+-EOF
+-fi
++
++case "$mirror" in
++  (*debian*)
++    debci-generate-apt-sources \
++      --mirror="$mirror" \
++      --suite="$SUITE" \
++      --components="$COMPONENTS" \
++      --source \
++      --buildd \
++      --dbgsym \
++      --arch="$debci_arch" \
++      > "$TARGET/etc/apt/sources.list"
++    ;;
++  (*)
++    debci-generate-apt-sources \
++      --mirror="$mirror" \
++      --suite="$SUITE" \
++      --components="$COMPONENTS" \
++      --source \
++      --arch="$debci_arch" \
++      > "$TARGET/etc/apt/sources.list"
++    ;;
++esac
+ 
+ # use a local proxy if available
+ http_proxy="${http_proxy:-}"
+-- 
+2.23.0
+

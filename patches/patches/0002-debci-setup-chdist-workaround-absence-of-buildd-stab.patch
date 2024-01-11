@@ -1,0 +1,27 @@
+From 04df07c9e4ecac96106f476cd3616b53bda7b2bb Mon Sep 17 00:00:00 2001
+From: Antonio Terceiro <terceiro@debian.org>
+Date: Fri, 24 May 2019 19:13:27 -0300
+Subject: [PATCH] debci-setup-chdist: workaround absence of
+ buildd-stable-proposed-updates
+
+---
+ bin/debci-setup-chdist | 3 +++
+ 1 files changed, 3 insertions(+)
+
+diff --git a/bin/debci-setup-chdist b/bin/debci-setup-chdist
+index 4086a03..e924ecb 100755
+--- a/bin/debci-setup-chdist
++++ b/bin/debci-setup-chdist
+@@ -57,6 +57,9 @@ deb-src $mirror $SUITE $COMPONENTS" > "$TARGET/etc/apt/sources.list"
+ if grep -q debian "$TARGET/etc/apt/sources.list"; then
+   if [ "$SUITE" = unstable ]; then
+     buildd_suite=buildd-$SUITE
++  elif [ "$SUITE" = stable ]; then
++    # workaround https://bugs.debian.org/880105
++    buildd_suite=buildd-$(distro-info --stable)-proposed-updates
+   else
+     buildd_suite=buildd-$SUITE-proposed-updates
+   fi
+-- 
+2.23.0
+
